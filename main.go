@@ -631,27 +631,71 @@ func handleTelegram(w http.ResponseWriter, r *http.Request) {
 		go sendTelegram(targetChat, msg)
 	}
 
-	// /start
-	if strings.HasPrefix(text, "/start") {
-		var uid, userKey string
-		err := db.QueryRow("SELECT uid, user_key FROM user_map WHERE chat_id = $1", chatIDStr).Scan(&uid, &userKey)
-		if err == nil {
-			sendAppMenu(chatIDStr)
-		} else {
-			newUid := generateRandomString(uidAlphabet, 8)
-			newKey := generateRandomString(keyAlphabet, 24)
-			_, dbErr := db.Exec(
-				"INSERT INTO user_map(uid, chat_id, user_key, updated_at) VALUES($1,$2,$3,$4)",
-				newUid, chatIDStr, newKey, time.Now().Unix(),
-			)
-			if dbErr != nil {
-				log.Printf("Insert error: %v", dbErr)
-				return
-			}
-			sendAppMenu(chatIDStr)
-		}
-		return
-	}
+	parts := strings.Fields(text)
+if len(parts) == 0 {
+    return
+}
+command := strings.SplitN(parts[0], "@", 2)[0]
+
+if command == "/redeem" {
+    if isAdmin {
+        go sendTelegram(chatIDStr, "Your admin account already has access. Send /start to open the menu.")
+        return
+    }
+    if len(parts) != 2 {
+        go sendTelegram(chatIDStr, "Usage: `/redeem YOUR-CODE`")
+        return
+    }
+
+    status, expiresAt, err := redeemCoupon(chatIDStr, update.Message.Chat.ID, parts[1])
+    if err != nil {
+        log.Printf("Coupon redemption failed for chat %s: %v", chatIDStr, err)
+        go sendTelegram(chatIDStr, "I couldn't redeem your coupon right now. Please try again.")
+        return
+    }
+
+    expiryIST := expiresAt.In(time.FixedZone("IST", 5*60*60+30*60)).
+        Format("02 Jan 2006, 15:04 MST")
+
+    switch status {
+    case "redeemed":
+        sendTelegram(chatIDStr, fmt.Sprintf("✅ Access activated until *%s*.", expiryIST))
+        sendAppMenu(chatIDStr)
+    case "active":
+        go sendTelegram(chatIDStr, fmt.Sprintf(
+            "Your access is active until *%s*. This coupon is still unused. Send /start to open the menu.",
+            expiryIST,
+        ))
+    case "unavailable":
+        go sendTelegram(chatIDStr, "This coupon is invalid or already used. "+
+            "Check the code or contact [@Mrpremium10](https://t.me/Mrpremium10).")
+    }
+    return
+}
+
+if !isAdmin {
+    var expiresAt time.Time
+    err := db.QueryRow(activeCouponExpirySQL, chatIDStr).Scan(&expiresAt)
+    if err == sql.ErrNoRows {
+        sendRestrictedAccess(chatIDStr)
+        return
+    }
+    if err != nil {
+        log.Printf("Bot access lookup failed for chat %s: %v", chatIDStr, err)
+        go sendTelegram(chatIDStr, "I couldn't check your access right now. Please try again.")
+        return
+    }
+}
+
+if command == "/start" {
+    if err := ensureWebhookAccount(db, chatIDStr); err != nil {
+        log.Printf("Webhook account setup failed for chat %s: %v", chatIDStr, err)
+        go sendTelegram(chatIDStr, "I couldn't open your account right now. Please try again.")
+        return
+    }
+    sendAppMenu(chatIDStr)
+    return
+}
 
 	// /myuid
 	if strings.HasPrefix(text, "/myuid") {
