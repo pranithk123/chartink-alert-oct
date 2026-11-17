@@ -503,10 +503,10 @@ const activeCouponExpirySQL = `
     LIMIT 1`
 
 func sendRestrictedAccess(chatID string) {
-    go sendTelegram(chatID, "🔒 *Paid access required*\n\n"+
-        "Contact [@Mrpremium10](https://t.me/Mrpremium10) for payment instructions.\n"+
-        "Once your payment is confirmed, you'll receive a coupon for one month of access.\n\n"+
-        "Redeem it here with `/redeem YOUR-CODE`.")
+    go sendTelegram(chatID, "🔒 *Bot access — $1 or ₹70 for one month*\n\n"+
+        "We've kept this bot free for the past 8 months. Keeping the service running reliably takes time, so we're introducing a small fee to support that work.\n\n"+
+        "Contact [@Mrpremium10](https://t.me/Mrpremium10) for payment instructions. Once your payment is confirmed, we'll send you a coupon code.\n\n"+
+        "Enter `/redeem YOUR-CODE` here to activate your month of access.")
 }
 
 func ensureWebhookAccount(executor interface {
