@@ -206,6 +206,20 @@ func authenticateAndAuthorize(w http.ResponseWriter, uid, key string) (string, b
 		userCacheMutex.Unlock()
 	}
 
+	if chatID != adminChatID {
+    var expiresAt time.Time
+    err := db.QueryRow(activeCouponExpirySQL, chatID).Scan(&expiresAt)
+    if err == sql.ErrNoRows {
+        fmt.Fprint(w, "PAYMENT_REQUIRED")
+        return "", false
+    }
+    if err != nil {
+        log.Printf("Webhook access lookup failed: %v", err)
+        http.Error(w, "TEMPORARILY_UNAVAILABLE", http.StatusServiceUnavailable)
+        return "", false
+    }
+}
+
 	todayStr := time.Now().Format("2006-01-02")
 	var currentUsage int
 	_ = db.QueryRow(
