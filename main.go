@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"crypto/subtle"
 
 	_ "github.com/lib/pq"
 )
@@ -62,6 +63,9 @@ func main() {
 		publicURL = "https://notifyu.me"
 	}
 	adminChatID = strings.TrimSpace(os.Getenv("ADMIN_CHAT_ID"))
+	if os.Getenv("TELEGRAM_WEBHOOK_SECRET") == "" {
+    log.Fatal("TELEGRAM_WEBHOOK_SECRET is missing")
+}
 
 	dbURL := os.Getenv("SPRING_DATASOURCE_URL")
 	if dbURL == "" {
@@ -573,6 +577,17 @@ func redeemCoupon(chatID string, telegramID int64, code string) (string, time.Ti
 
 // Telegram Bot Command Handler
 func handleTelegram(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+    http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+    return
+}
+
+secret := os.Getenv("TELEGRAM_WEBHOOK_SECRET")
+received := r.Header.Get("X-Telegram-Bot-Api-Secret-Token")
+if secret == "" || subtle.ConstantTimeCompare([]byte(received), []byte(secret)) != 1 {
+    http.Error(w, "Forbidden", http.StatusForbidden)
+    return
+}
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprint(w, "OK")
 
@@ -581,6 +596,7 @@ func handleTelegram(w http.ResponseWriter, r *http.Request) {
 		Message  *struct {
 			Chat struct {
 				ID int64 `json:"id"`
+				 Type string `json:"type"`
 			} `json:"chat"`
 			Text string `json:"text"`
 		} `json:"message"`
@@ -589,6 +605,9 @@ func handleTelegram(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&update); err != nil || update.Message == nil || update.Message.Text == "" {
 		return
 	}
+	if update.Message.Chat.Type != "private" {
+    return
+}
 
 	var rowsAffected int64
 	result, err := db.Exec(
