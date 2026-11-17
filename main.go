@@ -475,6 +475,88 @@ func buildUniversalMessage(body string) string {
 	return fmt.Sprintf("🔔 *Webhook Alert*\n\n%s", escapeMarkdown(body))
 }
 
+const activeCouponExpirySQL = `
+    SELECT expires_at
+    FROM coupon_codes
+    WHERE used_by = $1
+      AND is_used = TRUE
+      AND expires_at > statement_timestamp()
+    ORDER BY expires_at DESC
+    LIMIT 1`
+
+func sendRestrictedAccess(chatID string) {
+    go sendTelegram(chatID, "🔒 *Paid access required*\n\n"+
+        "Contact [@Mrpremium10](https://t.me/Mrpremium10) for payment instructions.\n"+
+        "Once your payment is confirmed, you'll receive a coupon for one month of access.\n\n"+
+        "Redeem it here with `/redeem YOUR-CODE`.")
+}
+
+func ensureWebhookAccount(executor interface {
+    Exec(string, ...interface{}) (sql.Result, error)
+}, chatID string) error {
+    _, err := executor.Exec(`
+        INSERT INTO user_map (uid, chat_id, user_key, updated_at)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (chat_id) DO NOTHING`,
+        generateRandomString(uidAlphabet, 8),
+        chatID,
+        generateRandomString(keyAlphabet, 24),
+        time.Now().Unix(),
+    )
+    return err
+}
+
+func redeemCoupon(chatID string, telegramID int64, code string) (string, time.Time, error) {
+    tx, err := db.Begin()
+    if err != nil {
+        return "", time.Time{}, err
+    }
+    defer tx.Rollback()
+
+    // Serialize redemption attempts for the same Telegram account.
+    if _, err := tx.Exec("SELECT pg_advisory_xact_lock($1::bigint)", telegramID); err != nil {
+        return "", time.Time{}, err
+    }
+
+    var expiresAt time.Time
+    err = tx.QueryRow(activeCouponExpirySQL, chatID).Scan(&expiresAt)
+    if err == nil {
+        return "active", expiresAt, nil
+    }
+    if err != sql.ErrNoRows {
+        return "", time.Time{}, err
+    }
+
+    // Only one transaction can claim an unused coupon.
+    err = tx.QueryRow(`
+        UPDATE coupon_codes
+        SET is_used = TRUE,
+            used_by = $1,
+            used_at = statement_timestamp(),
+            expires_at = ((statement_timestamp() AT TIME ZONE 'UTC') + INTERVAL '1 month')
+                         AT TIME ZONE 'UTC'
+        WHERE code = $2 AND is_used = FALSE
+        RETURNING expires_at`,
+        chatID, strings.ToUpper(strings.TrimSpace(code)),
+    ).Scan(&expiresAt)
+
+    if err == sql.ErrNoRows {
+        return "unavailable", time.Time{}, nil
+    }
+    if err != nil {
+        return "", time.Time{}, err
+    }
+
+    if err := ensureWebhookAccount(tx, chatID); err != nil {
+        return "", time.Time{}, err
+    }
+    if err := tx.Commit(); err != nil {
+        return "", time.Time{}, err
+    }
+
+    return "redeemed", expiresAt, nil
+}
+
 // Telegram Bot Command Handler
 func handleTelegram(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
