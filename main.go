@@ -656,6 +656,29 @@ if len(parts) == 0 {
 }
 command := strings.SplitN(parts[0], "@", 2)[0]
 
+	if command == "/newcoupon" {
+    if !isAdmin {
+        return
+    }
+
+    var code string
+    err := db.QueryRow(`
+        INSERT INTO public.coupon_codes (code)
+        VALUES (UPPER(REPLACE(gen_random_uuid()::text, '-', '')))
+        RETURNING code
+    `).Scan(&code)
+
+    if err != nil {
+        log.Printf("Coupon creation failed: %v", err)
+        go sendTelegram(chatIDStr, "❌ Couldn't create a coupon. Please try again.")
+        return
+    }
+
+    go sendTelegram(chatIDStr, "✅ *New coupon created*\n\n`"+code+
+        "`\n\nSend this code privately to the customer. They'll enter `/redeem` followed by the code.")
+    return
+}
+
 if command == "/redeem" {
     if isAdmin {
         go sendTelegram(chatIDStr, "Your admin account already has access. Send /start to open the menu.")
