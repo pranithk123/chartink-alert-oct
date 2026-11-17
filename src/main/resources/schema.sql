@@ -36,3 +36,34 @@ CREATE TABLE IF NOT EXISTS telegram_updates (
 
 -- Optional: Index for cleanup tasks
 CREATE INDEX IF NOT EXISTS ix_telegram_updates_time ON telegram_updates(processed_at);
+
+BEGIN;
+
+CREATE TABLE IF NOT EXISTS coupon_codes (
+    code TEXT PRIMARY KEY CHECK (code = UPPER(code)),
+    is_used BOOLEAN NOT NULL DEFAULT FALSE,
+    used_by TEXT,
+    used_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (
+        (is_used AND used_by IS NOT NULL AND used_at IS NOT NULL)
+        OR
+        (NOT is_used AND used_by IS NULL AND used_at IS NULL)
+    )
+);
+
+ALTER TABLE coupon_codes
+    ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+
+UPDATE coupon_codes
+SET expires_at = ((used_at AT TIME ZONE 'UTC') + INTERVAL '1 month')
+                 AT TIME ZONE 'UTC'
+WHERE is_used = TRUE AND expires_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS ix_coupon_codes_used_by_expiry
+    ON coupon_codes (used_by, expires_at DESC)
+    WHERE is_used = TRUE;
+
+ALTER TABLE coupon_codes ENABLE ROW LEVEL SECURITY;
+
+COMMIT;
