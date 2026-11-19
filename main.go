@@ -95,6 +95,9 @@ func main() {
 	if err = db.Ping(); err != nil {
 		log.Fatalf("Database unreachable: %v", err)
 	}
+	if _, err := db.Exec(alertDestinationSchema); err != nil {
+		log.Fatalf("Alert destination database setup failed: %v", err)
+	}
 	log.Println("✅ Supabase database connected successfully!")
 
 	// Keepalive ping every 4 minutes
@@ -286,7 +289,7 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	go sendTelegram(chatID, buildMessage(bodyStr))
+	go sendWebhookAlert(chatID, buildMessage(bodyStr))
 	fmt.Fprint(w, "OK")
 }
 
@@ -315,7 +318,7 @@ func handleTradingView(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	go sendTelegram(chatID, buildTradingViewMessage(bodyStr))
+	go sendWebhookAlert(chatID, buildTradingViewMessage(bodyStr))
 	fmt.Fprint(w, "OK")
 }
 
@@ -344,7 +347,7 @@ func handleUniversalWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	go sendTelegram(chatID, buildUniversalMessage(bodyStr))
+	go sendWebhookAlert(chatID, buildUniversalMessage(bodyStr))
 	fmt.Fprint(w, "OK")
 }
 
@@ -575,6 +578,127 @@ func redeemCoupon(chatID string, telegramID int64, code string) (string, time.Ti
     return "redeemed", expiresAt, nil
 }
 
+
+// A customer's alert destination is separate from their webhook credentials.
+const alertDestinationSchema = `
+CREATE TABLE IF NOT EXISTS public.alert_destinations (
+    owner_chat_id TEXT PRIMARY KEY,
+    destination_chat_id TEXT NOT NULL
+);
+ALTER TABLE public.alert_destinations ENABLE ROW LEVEL SECURITY;
+`
+
+type telegramIncomingMessage struct {
+    Chat struct {
+        ID int64 `json:"id"`
+        Type string `json:"type"`
+    } `json:"chat"`
+    Text string `json:"text"`
+}
+
+func telegramCall(method string, payload interface{}, result interface{}) error {
+    body, err := json.Marshal(payload)
+    if err != nil {
+        return err
+    }
+    url := fmt.Sprintf("https://api.telegram.org/bot%s/%s", botToken, method)
+    resp, err := httpClient.Post(url, "application/json", strings.NewReader(string(body)))
+    if err != nil {
+        return fmt.Errorf("Telegram %s request failed", method)
+    }
+    defer resp.Body.Close()
+
+    var response struct {
+        OK bool `json:"ok"`
+        Description string `json:"description"`
+        Result json.RawMessage `json:"result"`
+    }
+    if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+        return fmt.Errorf("couldn't read Telegram's response")
+    }
+    if !response.OK {
+        return fmt.Errorf("Telegram: %s", response.Description)
+    }
+    if result != nil {
+        return json.Unmarshal(response.Result, result)
+    }
+    return nil
+}
+
+func setAlertDestination(ownerID int64, target string) error {
+    ownerChatID := strconv.FormatInt(ownerID, 10)
+    if target == "private" {
+        _, err := db.Exec("DELETE FROM public.alert_destinations WHERE owner_chat_id = $1", ownerChatID)
+        if err != nil {
+            log.Printf("Destination reset failed: %v", err)
+            return fmt.Errorf("couldn't save your destination; please try again")
+        }
+        return nil
+    }
+
+    var chat struct {
+        ID int64 `json:"id"`
+        Type string `json:"type"`
+    }
+    if err := telegramCall("getChat", map[string]interface{}{"chat_id": target}, &chat); err != nil {
+        return err
+    }
+    if chat.Type != "channel" && chat.Type != "group" && chat.Type != "supergroup" {
+        return fmt.Errorf("please choose a channel or group")
+    }
+
+    // Only a destination administrator can direct their paid alerts there.
+    var member struct {
+        Status string `json:"status"`
+    }
+    if err := telegramCall("getChatMember", map[string]interface{}{
+        "chat_id": chat.ID,
+        "user_id": ownerID,
+    }, &member); err != nil {
+        return err
+    }
+    if member.Status != "creator" && member.Status != "administrator" {
+        return fmt.Errorf("you must be an administrator of that channel or group")
+    }
+
+    // Verify posting permission before storing the destination.
+    if err := telegramCall("sendMessage", map[string]interface{}{
+        "chat_id": chat.ID,
+        "text": "✅ Alert destination check successful.",
+    }, nil); err != nil {
+        return err
+    }
+    _, err := db.Exec(`
+        INSERT INTO public.alert_destinations (owner_chat_id, destination_chat_id)
+        VALUES ($1, $2)
+        ON CONFLICT (owner_chat_id)
+        DO UPDATE SET destination_chat_id = EXCLUDED.destination_chat_id`,
+        ownerChatID, strconv.FormatInt(chat.ID, 10))
+    if err != nil {
+        log.Printf("Destination save failed: %v", err)
+        return fmt.Errorf("couldn't save your destination; please try again")
+    }
+    return nil
+}
+
+func sendWebhookAlert(ownerChatID, text string) {
+    destination := ownerChatID
+    err := db.QueryRow(`
+        SELECT destination_chat_id FROM public.alert_destinations
+        WHERE owner_chat_id = $1`, ownerChatID).Scan(&destination)
+    if err != nil && err != sql.ErrNoRows {
+        log.Printf("Alert destination lookup failed: %v", err)
+        return
+    }
+    if err := telegramCall("sendMessage", map[string]interface{}{
+        "chat_id": destination,
+        "text": text,
+        "parse_mode": "Markdown",
+    }, nil); err != nil {
+        log.Printf("Alert delivery failed for owner %s: %v", ownerChatID, err)
+    }
+}
+
 // Telegram Bot Command Handler
 func handleTelegram(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -592,22 +716,29 @@ if secret == "" || subtle.ConstantTimeCompare([]byte(received), []byte(secret)) 
 	fmt.Fprint(w, "OK")
 
 	var update struct {
-		UpdateID int64 `json:"update_id"`
-		Message  *struct {
-			Chat struct {
-				ID int64 `json:"id"`
-				 Type string `json:"type"`
-			} `json:"chat"`
-			Text string `json:"text"`
-		} `json:"message"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&update); err != nil || update.Message == nil || update.Message.Text == "" {
-		return
-	}
-	if update.Message.Chat.Type != "private" {
-    return
-}
+        UpdateID int64 `json:"update_id"`
+        Message *telegramIncomingMessage `json:"message"`
+        ChannelPost *telegramIncomingMessage `json:"channel_post"`
+    }
+    if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
+        return
+    }
+    if update.Message == nil {
+        update.Message = update.ChannelPost
+    }
+    if update.Message == nil || update.Message.Text == "" {
+        return
+    }
+    // Only expose the chat ID in groups/channels; account commands stay private.
+    if update.Message.Chat.Type != "private" {
+        words := strings.Fields(update.Message.Text)
+        if len(words) > 0 && strings.SplitN(words[0], "@", 2)[0] == "/chatid" {
+            go sendTelegram(strconv.FormatInt(update.Message.Chat.ID, 10),
+                fmt.Sprintf("Chat ID: `%d`\n\nSend `/setdestination %d` in your private chat with the bot.",
+                    update.Message.Chat.ID, update.Message.Chat.ID))
+        }
+        return
+    }
 
 	var rowsAffected int64
 	result, err := db.Exec(
@@ -646,6 +777,7 @@ if secret == "" || subtle.ConstantTimeCompare([]byte(received), []byte(secret)) 
 			"💳 /payments — Stripe, Razorpay & Shopify\n" +
 			"⚡ /zapier — Zapier & Make.com workflows\n" +
 			"🌐 /api — Python scripts, cURL & servers\n\n" +
+			"/setdestination - Choose a channel or group\n\n" +
 			"/stats - Usage  •  /more - Actions"
 		go sendTelegram(targetChat, msg)
 	}
@@ -727,6 +859,26 @@ if !isAdmin {
         go sendTelegram(chatIDStr, "I couldn't check your access right now. Please try again.")
         return
     }
+}
+
+
+if command == "/setdestination" {
+    if len(parts) != 2 {
+        go sendTelegram(chatIDStr,
+            "Choose where your alerts should go:\n\n"+
+            "`/setdestination @YourChannel`\n"+
+            "`/setdestination -1001234567890`\n\n"+
+            "For private groups or channels, send /chatid there to get the ID.\n\n"+
+            "Use `/setdestination private` to receive alerts in this private chat again.\n\n"+
+            "Add the bot as an administrator first. For channels, allow it to post messages.")
+        return
+    }
+    if err := setAlertDestination(update.Message.Chat.ID, parts[1]); err != nil {
+        go sendTelegram(chatIDStr, "❌ "+escapeMarkdown(err.Error()))
+        return
+    }
+    go sendTelegram(chatIDStr, "✅ Your alert destination has been updated.")
+    return
 }
 
 if command == "/start" {
